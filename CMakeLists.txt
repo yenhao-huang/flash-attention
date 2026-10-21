@@ -6,6 +6,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(FA2_ENABLED ON)
 set(FA3_ENABLED ON)
+option(FA3_ENABLE_SM8X "Build FA3 Sm8x (Ampere/Ada) kernels" OFF)
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
@@ -262,11 +263,37 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
 
     set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
 
+    # Optional FA3 Sm8x (Ampere/Ada) kernels, e.g. for RTX 4090 (sm_89).
+    # Enable with -DFA3_ENABLE_SM8X=ON. "softcapall" files only #include the
+    # per-softcap files, so they are skipped to avoid duplicate instantiation.
+    set(FA3_SM8X_GEN_SRCS)
+    if (FA3_ENABLE_SM8X AND VLLM_GPU_LANG STREQUAL "CUDA")
+        file(GLOB FA3_SM8X_GEN_SRCS
+            "hopper/instantiations/flash_fwd_hdim*_bf16*_sm80.cu"
+            "hopper/instantiations/flash_fwd_hdim*_fp16*_sm80.cu")
+        list(FILTER FA3_SM8X_GEN_SRCS EXCLUDE REGEX "softcapall")
+    endif()
+
     # For CUDA we set the architectures on a per file basis
     # FaV3 is not yet supported in Blackwell
     if (VLLM_GPU_LANG STREQUAL "CUDA")
         cuda_archs_loose_intersection(FA3_ARCHS "9.0a;" "${CUDA_ARCHS}")
         message(STATUS "FA3_ARCHS: ${FA3_ARCHS}")
+        set(FA3_SM8X_ARCHS)
+        if (FA3_ENABLE_SM8X)
+            cuda_archs_loose_intersection(FA3_SM8X_ARCHS "8.0;8.6;8.9" "${CUDA_ARCHS}")
+            message(STATUS "FA3_SM8X_ARCHS: ${FA3_SM8X_ARCHS}")
+            if (NOT FA3_SM8X_ARCHS)
+                set(FA3_SM8X_GEN_SRCS)
+            endif()
+            set_gencode_flags_for_srcs(
+                SRCS "${FA3_SM8X_GEN_SRCS}"
+                CUDA_ARCHS "${FA3_SM8X_ARCHS}")
+        endif()
+        if (NOT FA3_ARCHS)
+            # No Hopper target: drop the sm90 kernels entirely (Sm8x-only build).
+            set(FA3_GEN_SRCS)
+        endif()
 
         set_gencode_flags_for_srcs(
             SRCS "${FA3_GEN_SRCS}"
@@ -275,8 +302,9 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
             SRCS 
                 hopper/flash_fwd_combine.cu
                 hopper/flash_prepare_scheduler.cu
-            CUDA_ARCHS "${FA3_ARCHS}")
+            CUDA_ARCHS "${FA3_SM8X_ARCHS};${FA3_ARCHS}")
     endif()
+    list(APPEND FA3_GEN_SRCS ${FA3_SM8X_GEN_SRCS})
 
     define_gpu_extension_target(
         _vllm_fa3_C
@@ -310,7 +338,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         FLASHATTENTION_VARLEN_ONLY # Custom flag to save on binary size
         FLASHATTENTION_PACKGQA_ONLY # Custom flag to save on binary size
         FLASHATTENTION_DISABLE_CLUSTER # disabled for varlen in any case
-        FLASHATTENTION_DISABLE_SM8x
+        # FLASHATTENTION_DISABLE_SM8x: set below unless FA3_ENABLE_SM8X
         # FLASHATTENTION_DISABLE_HDIMDIFF64
         # FLASHATTENTION_DISABLE_HDIMDIFF192
         FLASHATTENTION_DISABLE_APPENDKV
@@ -319,6 +347,16 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         TORCH_TARGET_VERSION=0x020A000000000000ULL
         USE_CUDA
     )
+
+    if (NOT FA3_SM8X_GEN_SRCS)
+        target_compile_definitions(_vllm_fa3_C PRIVATE FLASHATTENTION_DISABLE_SM8x)
+    endif()
+    if (VLLM_GPU_LANG STREQUAL "CUDA" AND NOT FA3_ARCHS)
+        # Sm8x-only build: never dispatch to sm90 kernels; FP8 is sm90-only.
+        target_compile_definitions(_vllm_fa3_C PRIVATE
+            FLASHATTENTION_DISABLE_SM90
+            FLASHATTENTION_DISABLE_FP8)
+    endif()
 
     # See _vllm_fa2_C above: enforce C++20 on the target for the vLLM subproject build.
     set_target_properties(_vllm_fa3_C PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
