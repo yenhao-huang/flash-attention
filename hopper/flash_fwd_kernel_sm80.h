@@ -65,9 +65,16 @@ public:
     // Kernel level shared memory storage
     // We overlap the shared memory for the mainloop and epilogue. However, we only want smem_o to overlap with smem_v + smem_k and not smem_q
     // and nothing else, so we'll pad in case sizeof(smem_o) > sizeof(smem_v) + sizeof(smem_k).
+    // With Share_QV_Smem (Q_in_regs), smem_q and smem_v are a union, so the region smem_o can
+    // overlap is the whole mainloop storage (max(Q, V) + K). Q has been moved to registers by then.
+    // Counting only smem_v + smem_k here over-pads and can exceed the 99 KB smem limit on sm86/89
+    // (e.g. hdim 256 with kBlockN = 48: 104 KB instead of 88 KB).
+    static constexpr int mainloop_smem_overlap = CollectiveMainloop::Share_QV_Smem
+        ? int(sizeof(typename CollectiveMainloop::TensorStorage))
+        : int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)))
+          + int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k)));
     static constexpr int mainloop_smem_padding_ = int(sizeof(typename CollectiveEpilogue::TensorStorage))
-        - int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)))
-        - int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k)));
+        - mainloop_smem_overlap;
     static constexpr int mainloop_smem_padding = mainloop_smem_padding_ < 0 ? 0 : mainloop_smem_padding_;
     struct SharedStorage {
         struct TensorStorage : cute::aligned_struct<128> {
